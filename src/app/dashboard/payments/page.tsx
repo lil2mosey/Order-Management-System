@@ -57,6 +57,7 @@ export default function PaymentsPage() {
   const [dateFilter, setDateFilter] = useState<string>('all');
   const [sortField, setSortField] = useState<string>('createdAt');
   const [sortDirection, setSortDirection] = useState<'asc' | 'desc'>('desc');
+  const [processingPayment, setProcessingPayment] = useState<string | null>(null);
   
   // M-Pesa modal state
   const [isMpesaModalOpen, setIsMpesaModalOpen] = useState(false);
@@ -272,24 +273,63 @@ export default function PaymentsPage() {
   };
 
   const handleMarkAsPaid = async (order: Order) => {
+    if (!order.id) {
+      toast.error('Invalid order ID');
+      return;
+    }
+
+    setProcessingPayment(order.id);
+    
     try {
-      // Process payment and deduct stock
-      await processPaymentAndDeductStock(
-        {
-          productId: order.itemId,
-          productName: order.item,
-          quantity: order.quantity,
-          price: order.price || order.amount / order.quantity,
-          amount: order.amount
-        },
-        'cash'
-      );
+      // First, update the order payment status in Firestore
+      const orderRef = doc(db, 'orders', order.id);
       
-      toast.success('Order marked as paid and stock updated successfully');
-      fetchOrders(); // Refresh the list
+      // Prepare update data - only include defined fields
+      const updateData: any = {
+        payment: 'Paid',
+        updatedAt: new Date(),
+        paymentMethod: 'cash',
+        paymentDate: new Date()
+      };
+      
+      // Only add mpesaReceipt if it exists
+      if (order.mpesaReceipt) {
+        updateData.mpesaReceipt = order.mpesaReceipt;
+      }
+      
+      // Update the order
+      await updateDoc(orderRef, updateData);
+      
+      // Now process stock deduction if we have item information
+      if (order.itemId && order.quantity > 0) {
+        try {
+          await processPaymentAndDeductStock(
+            {
+              productId: order.itemId,
+              productName: order.item,
+              quantity: order.quantity,
+              price: order.price || order.amount / order.quantity,
+              amount: order.amount
+            },
+            'cash'
+          );
+        } catch (stockError: any) {
+          console.error('Error deducting stock:', stockError);
+          // Don't throw - order is already marked as paid
+          toast.error('Order marked as paid but stock update failed: ' + (stockError.message || 'Unknown error'));
+        }
+      }
+      
+      toast.success('Order marked as paid successfully');
+      
+      // Refresh the orders list to show updated status
+      await fetchOrders();
+      
     } catch (error: any) {
       console.error('Error updating order:', error);
-      toast.error(error.message || 'Failed to update order');
+      toast.error(error.message || 'Failed to update order payment status');
+    } finally {
+      setProcessingPayment(null);
     }
   };
 
@@ -843,6 +883,7 @@ export default function PaymentsPage() {
                                 }}
                                 className="font-medium flex items-center gap-1 text-sm transition-all duration-200 hover:scale-105"
                                 style={{ color: '#5F9598' }}
+                                disabled={processingPayment === order.id}
                               >
                                 <Smartphone className="h-4 w-4" />
                                 M-PESA
@@ -852,10 +893,15 @@ export default function PaymentsPage() {
                                   e.stopPropagation();
                                   handleMarkAsPaid(order);
                                 }}
-                                className="font-medium flex items-center gap-1 text-sm transition-all duration-200 hover:scale-105"
+                                className="font-medium flex items-center gap-1 text-sm transition-all duration-200 hover:scale-105 disabled:opacity-50 disabled:cursor-not-allowed"
                                 style={{ color: '#1D546D' }}
+                                disabled={processingPayment === order.id}
                               >
-                                <CheckCircle className="h-4 w-4" />
+                                {processingPayment === order.id ? (
+                                  <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-current"></div>
+                                ) : (
+                                  <CheckCircle className="h-4 w-4" />
+                                )}
                                 Mark Paid
                               </button>
                             </>
@@ -872,7 +918,7 @@ export default function PaymentsPage() {
                             Print
                           </button>
                         </div>
-                      </td>
+                       </td>
                     </tr>
                   ))
                 )}
