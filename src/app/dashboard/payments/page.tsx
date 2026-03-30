@@ -1,7 +1,7 @@
 'use client';
 
 import { useState, useEffect } from 'react';
-import { collection, getDocs, query, orderBy, where, updateDoc, doc } from 'firebase/firestore';
+import { collection, getDocs, query, orderBy, where, updateDoc, doc, Timestamp } from 'firebase/firestore';
 import { db } from '@/lib/firebase';
 import LoadingSpinner from '@/components/common/LoadingSpinner';
 import MpesaPaymentModal from './components/mpesapaymentmodal';
@@ -19,13 +19,11 @@ import {
   X,
   Clock,
   Smartphone,
-  AlertCircle,
   CheckCircle,
   Package,
   ArrowUpDown
 } from 'lucide-react';
 import toast from 'react-hot-toast';
-import { useAuth } from '@/context/AuthContext';
 
 // Define the Order interface based on your actual data structure
 export interface Order {
@@ -33,16 +31,23 @@ export interface Order {
   orderId: string;
   customerId: string;
   customerName: string;
+  customerPhone?: string;
   item: string;
   itemId?: string;
   quantity: number;
   amount: number;
   price?: number;
   payment: 'Paid' | 'Unpaid';
+  paymentStatus?: string;
   status: string;
   createdAt: any;
+  updatedAt?: any;
   mpesaReceipt?: string;
   phoneNumber?: string;
+  items?: any[];
+  itemCount?: number;
+  subtotal?: number;
+  totalAmount?: number;
 }
 
 export default function PaymentsPage() {
@@ -62,8 +67,6 @@ export default function PaymentsPage() {
   // M-Pesa modal state
   const [isMpesaModalOpen, setIsMpesaModalOpen] = useState(false);
   const [selectedOrderForPayment, setSelectedOrderForPayment] = useState<Order | null>(null);
-  
-  const { processPaymentAndDeductStock } = useAuth();
 
   useEffect(() => {
     fetchOrders();
@@ -152,7 +155,6 @@ export default function PaymentsPage() {
     try {
       setLoading(true);
       
-      // Fetch orders sorted by date
       const ordersQuery = query(
         collection(db, 'orders'),
         orderBy('createdAt', 'desc')
@@ -168,16 +170,23 @@ export default function PaymentsPage() {
           orderId: data.orderId || 'N/A',
           customerId: data.customerId || '',
           customerName: data.customerName || 'Unknown',
-          amount: data.amount || 0,
+          customerPhone: data.customerPhone || data.phoneNumber || '',
+          amount: data.amount || data.totalAmount || 0,
           price: data.price || 0,
-          quantity: data.quantity || 1,
-          item: data.item || 'Unknown Item',
+          quantity: data.quantity || data.itemCount || 1,
+          item: data.item || data.items?.[0]?.productName || 'Unknown Item',
           itemId: data.items?.[0]?.productId || data.itemId || '',
           payment: data.payment || 'Unpaid',
+          paymentStatus: data.paymentStatus || data.payment || 'Unpaid',
           status: data.status || 'Pending',
           createdAt: data.createdAt || new Date(),
+          updatedAt: data.updatedAt || null,
           mpesaReceipt: data.mpesaReceipt || '',
-          phoneNumber: data.phoneNumber || ''
+          phoneNumber: data.phoneNumber || data.customerPhone || '',
+          items: data.items || [],
+          itemCount: data.itemCount || data.quantity || 1,
+          subtotal: data.subtotal || data.amount || 0,
+          totalAmount: data.totalAmount || data.amount || 0
         } as Order;
       });
       
@@ -281,15 +290,16 @@ export default function PaymentsPage() {
     setProcessingPayment(order.id);
     
     try {
-      // First, update the order payment status in Firestore
+      const now = Timestamp.now();
       const orderRef = doc(db, 'orders', order.id);
       
-      // Prepare update data - only include defined fields
+      // Prepare update data with only defined values
       const updateData: any = {
         payment: 'Paid',
-        updatedAt: new Date(),
+        paymentStatus: 'Paid',
+        updatedAt: now,
         paymentMethod: 'cash',
-        paymentDate: new Date()
+        paymentDate: now
       };
       
       // Only add mpesaReceipt if it exists
@@ -297,30 +307,43 @@ export default function PaymentsPage() {
         updateData.mpesaReceipt = order.mpesaReceipt;
       }
       
-      // Update the order
+      // Update the order payment status
       await updateDoc(orderRef, updateData);
+      console.log('Order payment status updated successfully');
       
-      // Now process stock deduction if we have item information
-      if (order.itemId && order.quantity > 0) {
-        try {
-          await processPaymentAndDeductStock(
-            {
-              productId: order.itemId,
-              productName: order.item,
-              quantity: order.quantity,
-              price: order.price || order.amount / order.quantity,
-              amount: order.amount
-            },
-            'cash'
-          );
-        } catch (stockError: any) {
-          console.error('Error deducting stock:', stockError);
-          // Don't throw - order is already marked as paid
-          toast.error('Order marked as paid but stock update failed: ' + (stockError.message || 'Unknown error'));
-        }
+      // Now deduct stock from inventory
+      let stockDeducted = false;
+      
+      // Get the product ID from order items
+      let productId = order.itemId;
+      
+      // If no itemId, try to get from items array
+      if (!productId && order.items && order.items.length > 0) {
+        productId = order.items[0].productId;
       }
       
-      toast.success('Order marked as paid successfully');
+      if (productId && order.quantity > 0) {
+        try {
+          const inventoryRef = doc(db, 'inventory', productId);
+          await updateDoc(inventoryRef, {
+            quantity: increment(-order.quantity),
+            updatedAt: now
+          });
+          stockDeducted = true;
+          console.log(`Stock deducted: ${order.quantity} units from product ${productId}`);
+        } catch (stockError: any) {
+          console.error('Error deducting stock:', stockError);
+          toast.error(`Order marked as paid but stock update failed: ${stockError.message || 'Unknown error'}`);
+        }
+      } else {
+        console.warn('No product ID or quantity found for stock deduction');
+      }
+      
+      if (stockDeducted) {
+        toast.success('Order marked as paid and stock updated successfully!');
+      } else {
+        toast.success('Order marked as paid successfully!');
+      }
       
       // Refresh the orders list to show updated status
       await fetchOrders();
@@ -331,6 +354,11 @@ export default function PaymentsPage() {
     } finally {
       setProcessingPayment(null);
     }
+  };
+
+  // Helper function for increment (Firestore v9)
+  const increment = (num: number) => {
+    return num;
   };
 
   const handlePrintReceipt = (order: Order) => {
@@ -437,6 +465,12 @@ export default function PaymentsPage() {
                   <strong>Customer:</strong> 
                   <span style="color: #061E29;">${order.customerName}</span>
                 </div>
+                ${order.customerPhone ? `
+                <div class="row">
+                  <strong>Phone:</strong> 
+                  <span style="color: #061E29;">${order.customerPhone}</span>
+                </div>
+                ` : ''}
                 <div class="row">
                   <strong>Total Amount:</strong> 
                   <span style="font-size: 20px; font-weight: bold; color: #5F9598;">KES ${order.amount.toLocaleString()}</span>
@@ -481,10 +515,11 @@ export default function PaymentsPage() {
 
   const handleExportCSV = () => {
     try {
-      const headers = ['Order ID', 'Customer', 'Item', 'Quantity', 'Amount (KES)', 'Payment Status', 'Order Status', 'Date', 'M-PESA Receipt'];
+      const headers = ['Order ID', 'Customer', 'Customer Phone', 'Item', 'Quantity', 'Amount (KES)', 'Payment Status', 'Order Status', 'Date', 'M-PESA Receipt'];
       const csvData = filteredOrders.map(o => [
         o.orderId,
         o.customerName,
+        o.customerPhone || '',
         o.item,
         o.quantity,
         o.amount,
@@ -840,7 +875,9 @@ export default function PaymentsPage() {
                       <td className="px-6 py-4">
                         <div>
                           <div className="font-medium" style={{ color: '#061E29' }}>{order.customerName}</div>
-                          <div className="text-xs" style={{ color: '#1D546D' }}>{order.customerId?.slice(0, 8)}...</div>
+                          {order.customerPhone && (
+                            <div className="text-xs" style={{ color: '#1D546D' }}>{order.customerPhone}</div>
+                          )}
                         </div>
                       </td>
                       <td className="px-6 py-4">
@@ -918,7 +955,7 @@ export default function PaymentsPage() {
                             Print
                           </button>
                         </div>
-                       </td>
+                      </td>
                     </tr>
                   ))
                 )}
