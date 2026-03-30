@@ -1,14 +1,13 @@
 'use client';
 
 import { useState, useEffect } from 'react';
-import { collection, addDoc, getDocs } from 'firebase/firestore';
+import { collection, addDoc, getDocs, doc, updateDoc, increment } from 'firebase/firestore';
 import { db } from '@/lib/firebase';
 import { useAuth } from '@/context/AuthContext';
 import { useRouter } from 'next/navigation';
 import toast from 'react-hot-toast';
-import { ShoppingBag, Package, Tag, ArrowLeft, Phone, User } from 'lucide-react';
+import { ShoppingBag, Package, Tag, ArrowLeft, Phone, User, AlertCircle } from 'lucide-react';
 import Link from 'next/link';
-import { Order, OrderStatus, PaymentStatus, OrderItem } from '@/types';
 
 interface InventoryItem {
   id: string;
@@ -16,6 +15,16 @@ interface InventoryItem {
   quantity: number;
   price?: number;
   status: string;
+  description?: string;
+  category?: string;
+}
+
+interface OrderItem {
+  productId: string;
+  productName: string;
+  quantity: number;
+  price: number;
+  subtotal: number;
 }
 
 export default function CustomerNewOrderPage() {
@@ -32,16 +41,17 @@ export default function CustomerNewOrderPage() {
     amount: 0,
     price: 0
   });
+  const [stockError, setStockError] = useState('');
 
   useEffect(() => {
     fetchInventory();
     // Pre-fill customer name from auth if available
-    if (user?.name) {
-      setFormData(prev => ({ ...prev, customerName: user.name || '' }));
+    if (user?.displayName) {
+      setFormData(prev => ({ ...prev, customerName: user.displayName || '' }));
     }
     // Pre-fill customer phone from auth if available
-    if (user?.phone) {
-      setFormData(prev => ({ ...prev, customerPhone: user.phone || '' }));
+    if (user?.phoneNumber) {
+      setFormData(prev => ({ ...prev, customerPhone: user.phoneNumber || '' }));
     }
   }, [user]);
 
@@ -51,9 +61,12 @@ export default function CustomerNewOrderPage() {
       const items = querySnapshot.docs.map(doc => ({
         id: doc.id,
         ...doc.data(),
-        price: doc.data().price || Math.floor(Math.random() * 5000) + 1000
+        price: doc.data().price || 0
       })) as InventoryItem[];
-      setInventory(items);
+      
+      // Filter only in-stock items
+      const inStockItems = items.filter(item => item.quantity > 0 && item.status === 'active');
+      setInventory(inStockItems);
     } catch (error) {
       console.error('Error fetching inventory:', error);
       toast.error('Failed to load inventory');
@@ -63,6 +76,13 @@ export default function CustomerNewOrderPage() {
   const handleItemChange = (itemName: string) => {
     const item = inventory.find(i => i.name === itemName) || null;
     setSelectedItem(item);
+    setStockError('');
+    
+    // Validate stock
+    if (item && formData.quantity > item.quantity) {
+      setStockError(`Only ${item.quantity} items available in stock`);
+    }
+    
     setFormData(prev => ({
       ...prev,
       item: itemName,
@@ -72,11 +92,19 @@ export default function CustomerNewOrderPage() {
   };
 
   const handleQuantityChange = (qty: number) => {
+    const newQty = Math.max(1, qty);
     setFormData(prev => ({
       ...prev,
-      quantity: qty,
-      amount: (selectedItem?.price || 0) * qty
+      quantity: newQty,
+      amount: (selectedItem?.price || 0) * newQty
     }));
+    
+    // Validate stock
+    if (selectedItem && newQty > selectedItem.quantity) {
+      setStockError(`Only ${selectedItem.quantity} items available in stock`);
+    } else {
+      setStockError('');
+    }
   };
 
   const handleInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -111,48 +139,71 @@ export default function CustomerNewOrderPage() {
       return;
     }
     
+    // Validate stock availability
+    if (!selectedItem) {
+      toast.error('Please select a valid item');
+      return;
+    }
+    
+    if (formData.quantity > selectedItem.quantity) {
+      toast.error(`Insufficient stock. Only ${selectedItem.quantity} items available.`);
+      return;
+    }
+    
     setLoading(true);
 
     try {
       const orderId = 'ORD' + Math.floor(10000000 + Math.random() * 90000000).toString();
+      const now = new Date();
       
       // Create OrderItem object
       const orderItem: OrderItem = {
-        productId: selectedItem?.id || '',
+        productId: selectedItem.id,
         productName: formData.item,
         quantity: formData.quantity,
-        price: selectedItem?.price || 0,
+        price: selectedItem.price || 0,
         subtotal: formData.amount,
       };
       
-      // ✅ Create order object matching your types
-      const order: Partial<Order> = {
-        orderId,
+      // Create the complete order object matching the database structure
+      const orderData = {
+        orderId: orderId,
         customerId: user?.uid || '',
         customerName: formData.customerName.trim(),
-        customerPhone: formData.customerPhone.trim(), // This will be a string, not undefined
+        customerPhone: formData.customerPhone.trim(),
         items: [orderItem],
         itemCount: formData.quantity,
         subtotal: formData.amount,
         tax: 0,
         shipping: 0,
         totalAmount: formData.amount,
-        status: 'Pending' as OrderStatus,
-        paymentStatus: 'Unpaid' as PaymentStatus,
-        createdAt: new Date(),
-        updatedAt: new Date(),
+        status: 'Pending',
+        payment: 'Unpaid', // Keep both for compatibility
+        paymentStatus: 'Unpaid',
+        createdAt: now,
+        updatedAt: now,
+        paymentDate: null,
+        paymentMethod: null,
+        mpesaReceipt: null,
+        phoneNumber: formData.customerPhone.trim()
       };
       
-      // ✅ Remove any undefined values before sending to Firestore
-      const cleanOrder = Object.fromEntries(
-        Object.entries(order).filter(([_, value]) => value !== undefined)
-      );
+      console.log('Creating order with data:', orderData);
       
-      console.log('Saving order:', cleanOrder);
+      // Create the order in Firestore
+      const orderRef = await addDoc(collection(db, 'orders'), orderData);
+      console.log('Order created with ID:', orderRef.id);
       
-      await addDoc(collection(db, 'orders'), cleanOrder);
+      // Update inventory stock
+      const inventoryRef = doc(db, 'inventory', selectedItem.id);
+      await updateDoc(inventoryRef, {
+        quantity: increment(-formData.quantity),
+        updatedAt: now
+      });
       
-      toast.success('Order created successfully!');
+      toast.success('Order created successfully! Stock has been reserved.');
+      
+      // Redirect to orders page
       router.push('/customer/orders');
     } catch (error) {
       console.error('Error creating order:', error);
@@ -259,6 +310,11 @@ export default function CustomerNewOrderPage() {
                   </option>
                 ))}
               </select>
+              {inventory.length === 0 && (
+                <p className="text-sm mt-2" style={{ color: '#EAB308' }}>
+                  No items available in inventory. Please check back later.
+                </p>
+              )}
             </div>
             
             {/* Quantity */}
@@ -281,15 +337,21 @@ export default function CustomerNewOrderPage() {
                     backgroundColor: 'white'
                   }}
                   min="1"
-                  max={selectedItem?.quantity || 99}
+                  max={selectedItem?.quantity || 999}
                   required
                 />
                 {selectedItem && (
                   <div className="px-4 py-2 rounded-lg text-sm" style={{ backgroundColor: '#F3F4F4', color: '#1D546D' }}>
-                    Max: {selectedItem.quantity}
+                    Available: {selectedItem.quantity}
                   </div>
                 )}
               </div>
+              {stockError && (
+                <div className="flex items-center gap-2 mt-2 p-2 rounded-lg" style={{ backgroundColor: '#FEF3C7', color: '#EAB308' }}>
+                  <AlertCircle className="h-4 w-4" />
+                  <span className="text-sm">{stockError}</span>
+                </div>
+              )}
             </div>
             
             {/* Total Amount */}
@@ -310,14 +372,21 @@ export default function CustomerNewOrderPage() {
             
             <button
               type="submit"
-              disabled={loading || !selectedItem}
-              className="w-full py-4 rounded-lg font-semibold text-lg transition-all duration-200 hover:opacity-90 hover:scale-105 disabled:opacity-50 disabled:cursor-not-allowed shadow-lg"
+              disabled={loading || !selectedItem || !!stockError || inventory.length === 0}
+              className="w-full py-4 rounded-lg font-semibold text-lg transition-all duration-200 hover:opacity-90 hover:scale-105 disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:scale-100 shadow-lg"
               style={{ 
                 backgroundColor: '#5F9598', 
                 color: '#F3F4F4'
               }}
             >
-              {loading ? 'Processing...' : 'Place Order'}
+              {loading ? (
+                <div className="flex items-center justify-center gap-2">
+                  <div className="animate-spin rounded-full h-5 w-5 border-b-2 border-white"></div>
+                  Processing...
+                </div>
+              ) : (
+                'Place Order'
+              )}
             </button>
           </form>
         </div>

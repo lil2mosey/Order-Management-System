@@ -2,6 +2,8 @@
 export type UserRole = 'customer' | 'seller';
 
 export interface User {
+  displayName: string;
+  phoneNumber: string;
   uid: string;
   email: string;
   name: string;
