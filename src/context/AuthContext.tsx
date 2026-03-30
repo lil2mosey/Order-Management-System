@@ -88,6 +88,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         createdAt: new Date(),
         phone: '',
         address: '',
+        displayName: '',
+        phoneNumber: ''
       };
 
       await setDoc(doc(db, 'users', userCredential.user.uid), userData);
